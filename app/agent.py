@@ -18,6 +18,7 @@ log = logging.getLogger("docagent.agent")
 
 STATUSES = ("received", "processing", "review", "confirm", "sent", "returned")
 CONF = ("high", "low", "missing")
+# Кроме CONF в базе бывают: "fixed" (исправил сотрудник) и "form" (взято из формы подачи).
 _DATE = re.compile(r"^(\d{2})\.(\d{2})\.(\d{4})$")
 
 
@@ -75,6 +76,68 @@ def normalize(raw: dict) -> dict:
         "summary": str(raw.get("summary") or "")[:600],
         "warnings": [str(w)[:300] for w in warnings][:10],
     }
+
+
+def _fold(v: str) -> str:
+    return " ".join((v or "").replace("ё", "е").replace("Ё", "Е").split()).casefold()
+
+
+def _same_surname(doc_word: str, form_word: str) -> bool:
+    """Фамилия в документе может стоять в родительном падеже: Садыкова = Садыков."""
+    a, b = _fold(doc_word), _fold(form_word)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    stem = b[:max(3, len(b) - 2)]
+    return a.startswith(stem) and abs(len(a) - len(b)) <= 3
+
+
+def apply_form(result: dict, surname: str, first_name: str, group: str,
+               kind: str = "", form_date: str = "", typed: bool = False) -> None:
+    """Сверяет поля документа с формой подачи: фамилия, имя, группа, вид заявления.
+
+    typed: студент написал заявление в форме (а не только приложил файл). Тогда дата подачи
+    известна точно, а отправка из личной формы заменяет подпись.
+    """
+    f = result["fields"]
+    if kind in doctypes.names():
+        if result["type"] == kind:
+            if result["type_confidence"] == "low":
+                result["type_confidence"] = "high"
+        elif result["type"] == doctypes.other_name() or result["type_confidence"] == "low":
+            result["type"], result["type_confidence"] = kind, "form"
+        else:
+            result["warnings"].append(f"Студент выбрал вид «{kind}», а по тексту похоже на «{result['type']}».")
+            result["type"], result["type_confidence"] = kind, "low"
+    if typed and form_date:
+        d = f["date"]
+        if d["c"] == "missing" or d["v"] == form_date:
+            f["date"] = {"v": form_date, "c": "form"}
+        if f["sign"]["c"] != "high":
+            f["sign"] = {"v": "есть", "c": "form"}
+    form_fio = " ".join(x for x in (surname, first_name) if x)
+    if form_fio:
+        fio = f["fio"]
+        if fio["c"] == "missing":
+            f["fio"] = {"v": form_fio, "c": "form"}
+        else:
+            doc_words = fio["v"].split()
+            if not doc_words or not _same_surname(doc_words[0], surname):
+                fio["c"] = "low"
+                result["warnings"].append(f"ФИО в документе («{fio['v']}») не совпадает с формой («{form_fio}»).")
+            elif fio["c"] == "low" and _fold(fio["v"]).startswith(_fold(form_fio)):
+                fio["c"] = "high"
+    if group:
+        g = f["group"]
+        norm = lambda v: re.sub(r"\s+", "", v or "").upper()
+        if g["c"] == "missing":
+            f["group"] = {"v": group, "c": "form"}
+        elif norm(g["v"]) != norm(group):
+            g["c"] = "low"
+            result["warnings"].append(f"Группа в документе («{g['v']}») не совпадает с формой («{group}»).")
+        elif g["c"] == "low":
+            g["c"] = "high"
 
 
 def compute_issues(type_name: str, type_conf: str, fields: dict) -> list[dict]:
@@ -159,7 +222,9 @@ def process(settings: Settings, db: Database, app_id: int) -> None:
         raw = None
         if settings.ai_enabled:
             try:
-                raw = llm.read_documents(settings, docs, text_input)
+                raw = llm.read_documents(settings, docs, text_input,
+                                         {"surname": app["student_surname"], "first_name": app["student_first"],
+                                          "group": app["student_group"], "kind": app["student_kind"]})
                 reader = "ai:" + settings.model
             except llm.ReaderError as e:
                 note = str(e)
@@ -177,6 +242,8 @@ def process(settings: Settings, db: Database, app_id: int) -> None:
                 if f["c"] == "high":
                     f["c"] = "low"
             result["type_confidence"] = "low"
+        apply_form(result, app["student_surname"], app["student_first"], app["student_group"],
+                   app["student_kind"], app["form_date"], bool(app["form_date"]))
         issues = compute_issues(result["type"], result["type_confidence"], result["fields"])
     except Exception as e:  # noqa: BLE001 - заявление не должно потеряться из-за ошибки
         log.exception("Processing failed for application %s", app_id)

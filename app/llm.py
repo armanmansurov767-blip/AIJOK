@@ -75,6 +75,8 @@ def _instruction() -> str:
         f"type: один из типов: {types}; «{doctypes.other_name()}», если ни один не подходит.",
         "type_confidence: \"high\", если тип ясно следует из текста; иначе \"low\".",
         "Поля (бери из основного заявления; если заявления нет, из документа):",
+        "Данные из <form> только для сверки: не переноси их в поля, если в документе их нет. "
+        "Если ФИО или группа в документе расходятся с формой, напиши об этом в warnings.",
         "fio: ФИО студента полностью, в именительном падеже (Иванов Иван Иванович), даже если в документе оно в родительном («от Иванова Ивана»).",
         "group: учебная группа как написано (например ИС-24/2).",
         "course: номер курса, только цифра.",
@@ -89,7 +91,7 @@ def _instruction() -> str:
     ])
 
 
-def build_content(docs: list[InputDoc], text_input: str, max_text_chars: int) -> list[dict]:
+def build_content(docs: list[InputDoc], text_input: str, max_text_chars: int, form: dict | None = None) -> list[dict]:
     content: list[dict] = []
     total_text = 0
     for d in docs:
@@ -115,6 +117,12 @@ def build_content(docs: list[InputDoc], text_input: str, max_text_chars: int) ->
         total_text += len(text_input)
         content.append({"type": "text",
                         "text": f'<document name="текст, введённый студентом">\n{escape(text_input, quote=False)}\n</document>'})
+    if form:
+        parts = [f"{label}: {escape(str(form.get(key, '')), quote=False)}"
+                 for key, label in (("surname", "Фамилия"), ("first_name", "Имя"), ("group", "Группа"),
+                                   ("kind", "Вид заявления")) if form.get(key)]
+        if parts:
+            content.append({"type": "text", "text": "<form>Студент указал в форме подачи: " + "; ".join(parts) + "</form>"})
     if total_text > max_text_chars:
         raise ReaderError(f"Документы слишком длинные для автоматического чтения ({total_text} символов). "
                           "Проверьте их вручную.")
@@ -128,11 +136,11 @@ def make_client(settings: Settings):
     return anthropic.Anthropic(timeout=float(settings.ai_timeout), max_retries=2)
 
 
-def read_documents(settings: Settings, docs: list[InputDoc], text_input: str) -> dict:
+def read_documents(settings: Settings, docs: list[InputDoc], text_input: str, form: dict | None = None) -> dict:
     """Отправляет документы в Claude и возвращает разобранный JSON по схеме."""
     import anthropic
 
-    content = build_content(docs, text_input, settings.max_text_chars)
+    content = build_content(docs, text_input, settings.max_text_chars, form)
     client = make_client(settings)
     try:
         resp = client.beta.messages.create(

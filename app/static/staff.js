@@ -13,19 +13,13 @@
   var listTimer = null, detailTimer = null;
 
   var PILL = { received: "new", processing: "run", review: "warn", confirm: "human", sent: "ok", returned: "crit" };
-  var CONF = { high: ["Найдено", "ok"], low: ["Не уверен", "warn"], missing: ["Нет", "crit"], fixed: ["Исправлено", "human"] };
+  var CONF = { high: ["Найдено", "ok"], low: ["Не уверен", "warn"], missing: ["Нет", "crit"], fixed: ["Исправлено", "human"], form: ["Из формы", "ok"] };
   var EVENTS = {
     submitted: "Студент отправил обращение", processing: "Агент начал обработку", read: "Агент прочитал документы",
     needs_review: "Нужна проверка сотрудником", registered: "Записано в журнал", draft_ready: "Готов проект ответа",
     fixed: "Исправлены поля", checked: "Сотрудник проверил", reply_edited: "Изменён текст ответа",
     sent: "Ответ подтверждён", returned: "Возвращено на доработку", mail: "Письмо студенту",
     reprocess: "Запущена переобработка", error: "Ошибка обработки"
-  };
-  var MAIL = {
-    sent: ["Письмо отправлено студенту.", "ok"],
-    not_configured: ["Почта не настроена: ответ виден студенту на странице статуса.", "warn"],
-    no_address: ["Студент не указал почту: ответ виден на странице статуса.", "warn"],
-    failed: ["Письмо не ушло (ошибка почтового сервера). Ответ виден на странице статуса.", "err"]
   };
   var FILTERS = [["open", "Открытые"], ["review", "Нужна проверка"], ["confirm", "Ждут подтверждения"],
     ["processing", "В обработке"], ["closed", "Закрытые"], ["", "Все"]];
@@ -160,11 +154,11 @@
     }, fail);
   }
 
-  function setDetail(d, mailStatus) {
+  function setDetail(d, note) {
     S.detail = d; S.edits = {}; S.typeEdit = null;
     renderDetail();
     loadList();
-    if (mailStatus && MAIL[mailStatus]) DA.toast(MAIL[mailStatus][0], MAIL[mailStatus][1]);
+    if (note) DA.toast(note);
   }
 
   function act(method, url, body) {
@@ -222,7 +216,8 @@
           d.reg_no ? h("span", { class: "mono hint" }, d.reg_no) : null),
         h("dl", { class: "kv" },
           h("dt", null, "Получено"), h("dd", null, DA.fmtDate(d.created_at)),
-          h("dt", null, "Студент"), h("dd", null, [d.student_name, d.student_email].filter(Boolean).join(", ") || "не указал контакты"),
+          h("dt", null, "Студент (из формы)"), h("dd", null, (d.student_name || "—") + (d.student_group ? ", группа " + d.student_group : "")),
+          d.student_kind ? [h("dt", null, "Вид (выбрал студент)"), h("dd", null, d.student_kind)] : null,
           d.summary ? [h("dt", null, "Кратко"), h("dd", null, d.summary)] : null),
         sources.length > 1 ? h("div", { class: "ftabs" }, sources.map(function (s, i) {
           return h("button", { class: "tab", type: "button", "aria-pressed": i === S.tab ? "true" : "false",
@@ -314,7 +309,7 @@
       reply.value = d.reply_text;
       blocks.push(h("div", { class: "card stack" },
         h("h2", null, "Проект ответа студенту"),
-        h("p", null, "Проверьте и при необходимости исправьте текст. Студент получит его только после подтверждения."),
+        h("p", null, "Проверьте и при необходимости исправьте текст. Студент увидит его по номеру заявления только после подтверждения."),
         reply,
         h("div", { class: "row end" },
           h("button", { class: "btn small", type: "button", onclick: function () {
@@ -325,7 +320,7 @@
           h("button", { class: "btn human", type: "button", onclick: function () {
             if (Object.keys(S.edits).length || S.typeEdit !== null) { DA.toast("Сначала сохраните исправления полей.", "warn"); return; }
             act("POST", "/api/staff/applications/" + d.id + "/send", { text: reply.value }).then(function (nd) {
-              setDetail(nd, nd.mail_status);
+              setDetail(nd, "Ответ отправлен: студент увидит его по номеру " + nd.number + ".");
             }, fail);
           } }, "Подтвердить и отправить"))));
     } else if (d.status === "sent") {
@@ -351,7 +346,7 @@
           h("div", { class: "row" },
             h("button", { class: "btn danger", type: "button", onclick: function () {
               act("POST", "/api/staff/applications/" + d.id + "/return", { message: msg.value }).then(function (nd) {
-                setDetail(nd, nd.mail_status);
+                setDetail(nd, "Заявление возвращено на доработку.");
               }, fail);
             } }, "Вернуть на доработку"),
             h("span", { class: "spacer" }),
@@ -365,8 +360,7 @@
       h("ul", { class: "history" }, d.events.map(function (e) {
         var who = e.actor === "agent" ? "агент" : e.actor === "student" ? "студент" : e.actor.replace("staff:", "");
         var det = "";
-        if (e.action === "mail") det = (MAIL[e.details] || [e.details])[0];
-        else if (e.action === "registered") { try { det = JSON.parse(e.details).reg_no; } catch (x) { det = ""; } }
+        if (e.action === "registered") { try { det = JSON.parse(e.details).reg_no; } catch (x) { det = ""; } }
         return h("li", null, h("time", null, DA.fmtDate(e.at)),
           h("span", null, (EVENTS[e.action] || e.action) + " (" + who + ")" + (det ? ": " + det : "")));
       })),
@@ -456,8 +450,7 @@
           })) : h("p", null, "Пока нет данных.")),
         h("div", { class: "card" }, h("h3", null, "Система"),
           h("dl", { class: "kv" },
-            h("dt", null, "Чтение документов"), h("dd", null, s.ai ? "ИИ, модель " + s.model : "правила без ИИ (ключ API не задан)"),
-            h("dt", null, "Почта"), h("dd", null, s.smtp ? "настроена" : "не настроена: ответы видны только на странице статуса")))));
+            h("dt", null, "Чтение документов"), h("dd", null, s.ai ? "ИИ, модель " + s.model : "правила без ИИ (ключ API не задан)")))));
     }, fail);
   }
   function stat(v, label) { return h("div", { class: "stat" }, h("b", null, String(v)), h("span", null, label)); }

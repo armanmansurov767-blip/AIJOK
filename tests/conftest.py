@@ -42,8 +42,8 @@ class FakeReader:
         self.response = GOOD
         self.error = None
 
-    def __call__(self, settings, docs, text_input):
-        self.calls.append({"docs": docs, "text": text_input})
+    def __call__(self, settings, docs, text_input, form=None):
+        self.calls.append({"docs": docs, "text": text_input, "form": form})
         if self.error:
             raise self.error
         r = self.response
@@ -60,7 +60,7 @@ def reader(monkeypatch):
 @pytest.fixture
 def settings(tmp_path):
     return Settings(data_dir=tmp_path / "data", ai_enabled=True, sync_processing=True,
-                    public_url="http://test", smtp_host="", smtp_from="", org_name="Тестовый колледж")
+                    public_url="http://test", org_name="Тестовый колледж")
 
 
 def _add_user(db, login, password, role):
@@ -99,8 +99,9 @@ def admin(app):
         yield c
 
 
-def submit(client, text="", files=None, email="", name="", consent="on"):
-    data = {"text": text, "email": email, "name": name, "consent": consent}
+def submit(client, text="", files=None, surname="Садыков", first_name="Нурлан", group="ИС-24/2",
+           kind="Пересдача экзамена"):
+    data = {"text": text, "surname": surname, "first_name": first_name, "group": group, "kind": kind}
     return client.post("/api/applications", data=data, files=files or [])
 
 

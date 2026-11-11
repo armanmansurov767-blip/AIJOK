@@ -70,13 +70,6 @@ class Settings:
     max_text_chars: int = field(default_factory=lambda: _int("DOCAGENT_MAX_TEXT_CHARS", 150_000))
     max_pdf_pages: int = field(default_factory=lambda: _int("DOCAGENT_MAX_PDF_PAGES", 100))
 
-    smtp_host: str = field(default_factory=lambda: os.environ.get("DOCAGENT_SMTP_HOST", ""))
-    smtp_port: int = field(default_factory=lambda: _int("DOCAGENT_SMTP_PORT", 587))
-    smtp_user: str = field(default_factory=lambda: os.environ.get("DOCAGENT_SMTP_USER", ""))
-    smtp_password: str = field(default_factory=lambda: os.environ.get("DOCAGENT_SMTP_PASSWORD", ""))
-    smtp_from: str = field(default_factory=lambda: os.environ.get("DOCAGENT_SMTP_FROM", ""))
-    smtp_ssl: bool = field(default_factory=lambda: _bool("DOCAGENT_SMTP_SSL", False))
-
     secure_cookies: bool = field(default_factory=lambda: _bool("DOCAGENT_SECURE_COOKIES", False))
     session_hours: int = field(default_factory=lambda: _int("DOCAGENT_SESSION_HOURS", 12))
     workers: int = field(default_factory=lambda: _int("DOCAGENT_WORKERS", 2))
@@ -90,10 +83,6 @@ class Settings:
     @property
     def upload_dir(self) -> Path:
         return self.data_dir / "uploads"
-
-    @property
-    def smtp_enabled(self) -> bool:
-        return bool(self.smtp_host and self.smtp_from)
 
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)

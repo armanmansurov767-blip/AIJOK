@@ -31,6 +31,11 @@ CREATE TABLE IF NOT EXISTS applications (
   status TEXT NOT NULL,
   student_email TEXT NOT NULL DEFAULT '',
   student_name TEXT NOT NULL DEFAULT '',
+  student_surname TEXT NOT NULL DEFAULT '',
+  student_first TEXT NOT NULL DEFAULT '',
+  student_group TEXT NOT NULL DEFAULT '',
+  student_kind TEXT NOT NULL DEFAULT '',
+  form_date TEXT NOT NULL DEFAULT '',
   text_input TEXT NOT NULL DEFAULT '',
   doc_kind TEXT NOT NULL DEFAULT '',
   type TEXT NOT NULL DEFAULT '',
@@ -101,6 +106,15 @@ class Database:
         self._lock = threading.Lock()   # одна запись за раз; чтение параллельно
         with self.connect() as con:
             con.executescript(SCHEMA)
+            self._migrate(con)
+
+    @staticmethod
+    def _migrate(con: sqlite3.Connection) -> None:
+        """Добавляет колонки, которых нет в базе, созданной прошлой версией."""
+        have = {r[1] for r in con.execute("PRAGMA table_info(applications)")}
+        for col in ("student_surname", "student_first", "student_group", "student_kind", "form_date"):
+            if col not in have:
+                con.execute(f"ALTER TABLE applications ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
 
     def _open(self) -> sqlite3.Connection:
         con = sqlite3.connect(self.path, timeout=30, isolation_level=None)

@@ -69,4 +69,33 @@ def keyword_table() -> list[tuple[str, list[str]]]:
 
 
 def public_list() -> list[dict]:
-    return [{"name": t["name"], "owner": t["owner"], "required": t["required"]} for t in _load()["types"]]
+    return [{"name": t["name"], "owner": t["owner"], "required": t["required"],
+             "addressee": t.get("addressee", ""), "wording": t.get("wording", "")} for t in _load()["types"]]
+
+
+def form_choices() -> list[dict]:
+    """Виды заявлений для формы студента: название, кому, готовая формулировка."""
+    other = _load()["other"]
+    return [{"name": t["name"], "addressee": t.get("addressee", ""), "wording": t.get("wording", "")}
+            for t in _load()["types"]] + [{"name": other["name"], "addressee": other.get("addressee", ""),
+                                           "wording": other.get("wording", "")}]
+
+
+def addressee(name: str) -> str:
+    t = get(name)
+    return (t or _load()["other"]).get("addressee", "") or "Декану факультета"
+
+
+def compose_text(type_name: str, surname: str, first_name: str, group: str, body: str, date: str) -> str:
+    """Собирает полный текст заявления из формы: шапка, ЗАЯВЛЕНИЕ, формулировка, дата."""
+    return "\n".join([
+        addressee(type_name),
+        f"от студента группы {group}",
+        f"{surname} {first_name}",
+        "",
+        "ЗАЯВЛЕНИЕ",
+        "",
+        body.strip(),
+        "",
+        f"Дата: {date}",
+    ])

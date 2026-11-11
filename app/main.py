@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import secrets
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -18,7 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import agent, doctypes, mailer
+from . import agent, doctypes
 from .config import Settings, load_dotenv
 from .db import Database, add_event, now
 from .extract import ACCEPT, FileRejected, detect, extract_text, safe_filename
@@ -29,6 +30,8 @@ log = logging.getLogger("docagent")
 STATIC = Path(__file__).with_name("static")
 COOKIE = "docagent_session"
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{20,64}$")
+NAME_RE = re.compile(r"^[A-Za-zА-Яа-яЁёӘәҒғҚқҢңӨөҰұҮүҺһІі' -]{1,60}$")
+GROUP_RE = re.compile(r"^[A-ZА-ЯЁӘҒҚҢӨҰҮҺІ0-9][A-ZА-ЯЁӘҒҚҢӨҰҮҺІ0-9 ./-]{0,19}$")
 
 STATUS_LABEL = {
     "received": "Принято",
@@ -113,9 +116,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             run_agent(app_id)
         else:
             executor.submit(run_agent, app_id)
-
-    def notify(app_id: int | None, to: str, subject: str, body: str) -> str:
-        return mailer.send(settings, db, app_id, to, subject, body)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -204,6 +204,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "max_file_mb": settings.max_file_mb,
             "max_image_mb": settings.max_image_mb,
             "types": doctypes.names(),
+            "kinds": doctypes.form_choices(),
         }
 
     async def _read_limited(f: UploadFile, limit: int) -> bytes:
@@ -222,24 +223,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def submit(request: Request,
                      files: list[UploadFile] = File(default=[]),
                      text: str = Form(""),
-                     email: str = Form(""),
-                     name: str = Form(""),
-                     consent: str = Form("")):
+                     kind: str = Form(""),
+                     surname: str = Form(""),
+                     first_name: str = Form(""),
+                     group: str = Form("")):
         ip = ip_of(request)
         if submit_limiter.blocked(ip):
             raise HTTPException(429, "Слишком много заявлений с этого адреса. Попробуйте через час.")
-        if consent not in ("on", "true", "1", "yes"):
-            raise HTTPException(400, "Нужно согласие на обработку персональных данных.")
-        email = email.strip()
-        if email and not mailer.valid_email(email):
-            raise HTTPException(400, "Проверьте адрес электронной почты.")
-        name = name.strip()[:150]
+        surname = " ".join(surname.split())
+        first_name = " ".join(first_name.split())
+        group = " ".join(group.split()).upper()
+        if not NAME_RE.match(surname):
+            raise HTTPException(400, "Укажите фамилию (только буквы, до 60 символов).")
+        if not NAME_RE.match(first_name):
+            raise HTTPException(400, "Укажите имя (только буквы, до 60 символов).")
+        if not GROUP_RE.match(group):
+            raise HTTPException(400, "Укажите группу, например ИС-24/2.")
+        if kind not in doctypes.all_names():
+            raise HTTPException(400, "Выберите вид заявления.")
         text = text.strip()
         if len(text) > 20000:
             raise HTTPException(400, "Текст слишком длинный: больше 20 000 символов. Приложите его файлом.")
         files = [f for f in files if f.filename]
-        if not files and len(text) < 20:
-            raise HTTPException(400, "Приложите файл или вставьте текст заявления (не короче 20 символов).")
+        if not files and len(text) < 10:
+            raise HTTPException(400, "Напишите текст заявления или приложите файл.")
         if len(files) > settings.max_files:
             raise HTTPException(400, f"Можно приложить не больше {settings.max_files} файлов.")
 
@@ -273,10 +280,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             sname = secrets.token_hex(16) + det.ext
             (settings.upload_dir / sname).write_bytes(data)
             stored.append(sname)
+        form_date = datetime.now().strftime("%d.%m.%Y") if text else ""
+        full_text = doctypes.compose_text(kind, surname, first_name, group, text, form_date) if text else ""
         with db.tx() as con:
             cur = con.execute(
-                "INSERT INTO applications(public_token, status, student_email, student_name, text_input, created_at, updated_at) "
-                "VALUES (?, 'received', ?, ?, ?, ?, ?)", (token, email, name, text, now(), now()))
+                "INSERT INTO applications(public_token, status, student_name, student_surname, student_first, "
+                "student_group, student_kind, form_date, text_input, created_at, updated_at) "
+                "VALUES (?, 'received', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (token, f"{surname} {first_name}", surname, first_name, group, kind, form_date, full_text, now(), now()))
             app_id = cur.lastrowid
             for (fname, det, data, extracted, pages), sname in zip(prepared, stored):
                 con.execute("INSERT INTO files(application_id, stored_name, original_name, kind, mime, size, pages, "
@@ -284,17 +295,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             (app_id, sname, fname, det.kind, det.mime, len(data), pages, extracted, now()))
             add_event(con, app_id, "student", "submitted",
                       {"files": [p[0] for p in prepared], "text": bool(text)})
-        status_url = f"{settings.public_url}/status/{token}"
-        if email:
-            body = (f"Здравствуйте{', ' + name if name else ''}!\n\nВаше обращение {request_no(app_id)} получено. "
-                    f"Следить за ним можно по ссылке:\n{status_url}\n\nОтвет придёт на эту почту после проверки сотрудником.\n\n"
-                    f"{settings.org_name}")
-            if settings.sync_processing:
-                notify(app_id, email, f"Обращение {request_no(app_id)} получено", body)
-            else:
-                executor.submit(notify, app_id, email, f"Обращение {request_no(app_id)} получено", body)
         schedule(app_id)
-        return {"number": request_no(app_id), "token": token, "status_url": f"/status/{token}"}
+        return {"token": token, "status_url": f"/status/{token}", "kind": kind}
 
     @app.get("/api/public/{token}")
     def public_status(token: str):
@@ -306,7 +308,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         files = db.all("SELECT original_name FROM files WHERE application_id = ? ORDER BY id", (a["id"],))
         registered = bool(a["reg_no"])
         return {
-            "number": request_no(a["id"]),
+            "kind": a["student_kind"],
             "created_at": a["created_at"],
             "status": a["status"],
             "status_label": STUDENT_STATUS.get(a["status"], a["status"]),
@@ -318,7 +320,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "answered_at": a["sent_at"] if a["status"] in ("sent", "returned") else "",
             "files": [f["original_name"] for f in files],
             "has_text": bool(a["text_input"]),
-            "email": bool(a["student_email"]),
+            "name": a["student_name"],
+            "group": a["student_group"],
         }
 
     # ---------- staff: auth ----------
@@ -375,7 +378,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "status_label": STATUS_LABEL.get(a["status"], a["status"]),
             "type": a["type"],
             "fio": (fields.get("fio") or {}).get("v", "") or a["student_name"],
-            "group": (fields.get("group") or {}).get("v", ""),
+            "group": (fields.get("group") or {}).get("v", "") or a["student_group"],
             "reg_no": a["reg_no"] or "",
             "issues": len(json.loads(a["issues_json"] or "[]")),
             "manual": bool(a["manual"]),
@@ -423,13 +426,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         files = db.all("SELECT id, original_name, kind, mime, size, pages, extracted_text FROM files "
                        "WHERE application_id = ? ORDER BY id", (app_id,))
         events = db.all("SELECT at, actor, action, details FROM events WHERE application_id = ? ORDER BY id", (app_id,))
-        mails = db.all("SELECT to_email, subject, status, error, created_at FROM outbox WHERE application_id = ? ORDER BY id",
-                       (app_id,))
         handler = db.one("SELECT name FROM users WHERE id = ?", (a["handled_by"],)) if a["handled_by"] else None
         return {
             **_summary_row(a),
-            "student_email": a["student_email"],
             "student_name": a["student_name"],
+            "student_group": a["student_group"],
+            "student_kind": a["student_kind"],
             "text_input": a["text_input"],
             "doc_kind": a["doc_kind"],
             "type_confidence": a["type_confidence"],
@@ -450,7 +452,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "files": [{"id": f["id"], "name": f["original_name"], "kind": f["kind"], "mime": f["mime"],
                        "size": f["size"], "pages": f["pages"], "text": f["extracted_text"]} for f in files],
             "events": [dict(e) for e in events],
-            "mails": [dict(m) for m in mails],
             "public_url": f"{settings.public_url}/status/{a['public_token']}",
         }
 
@@ -494,26 +495,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/staff/applications/{app_id}/send")
     def send_reply(app_id: int, body: SendIn, user=Depends(current_user)):
         _get_app(app_id)
-        a = action(agent.mark_sent, db, app_id, actor(user), user["id"], body.text)
-        link = f"{settings.public_url}/status/{a['public_token']}"
-        status = notify(app_id, a["student_email"], f"Ответ на обращение {request_no(app_id)}: {a['type']}, {a['reg_no']}",
-                        a["reply_text"] + f"\n\nСтатус обращения: {link}")
-        with db.tx() as con:
-            add_event(con, app_id, "agent", "mail", status)
-        return {**get_application(app_id, user), "mail_status": status}
+        action(agent.mark_sent, db, app_id, actor(user), user["id"], body.text)
+        return get_application(app_id, user)
 
     @app.post("/api/staff/applications/{app_id}/return")
     def return_to_student(app_id: int, body: ReturnIn, user=Depends(current_user)):
         _get_app(app_id)
-        a = action(agent.mark_returned, db, app_id, actor(user), user["id"], body.message)
-        link = f"{settings.public_url}/status/{a['public_token']}"
-        status = notify(app_id, a["student_email"], f"Обращение {request_no(app_id)}: нужно доработать",
-                        f"Здравствуйте!\n\nПо вашему обращению {request_no(app_id)} нужно доработать документы:\n\n"
-                        f"{body.message.strip()}\n\nПодайте исправленное заявление заново: {settings.public_url}/\n"
-                        f"Статус обращения: {link}\n\n{settings.org_name}")
-        with db.tx() as con:
-            add_event(con, app_id, "agent", "mail", status)
-        return {**get_application(app_id, user), "mail_status": status}
+        action(agent.mark_returned, db, app_id, actor(user), user["id"], body.message)
+        return get_application(app_id, user)
 
     @app.post("/api/staff/applications/{app_id}/reprocess")
     def reprocess(app_id: int, user=Depends(current_user)):
@@ -577,7 +566,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "manual": done["m"] or 0,
             "ai": settings.ai_enabled,
             "model": settings.model if settings.ai_enabled else "",
-            "smtp": settings.smtp_enabled,
         }
 
     # ---------- staff: users (admin) ----------

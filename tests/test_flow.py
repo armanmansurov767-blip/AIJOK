@@ -35,10 +35,10 @@ def test_pages_served(client):
 
 
 def test_clean_path_to_reply(client, staff, reader):
-    r = submit(client, text=SAMPLE_TEXT, email="student@example.com", name="Нурлан")
+    r = submit(client, text=SAMPLE_TEXT)
     assert r.status_code == 200, r.text
     token = r.json()["token"]
-    assert r.json()["number"].startswith("З-")
+    assert r.json()["kind"] == "Пересдача экзамена" and "number" not in r.json()
 
     pub = client.get(f"/api/public/{token}").json()
     assert pub["status"] == "confirm"
@@ -47,8 +47,13 @@ def test_clean_path_to_reply(client, staff, reader):
     year = datetime.now().year
     assert pub["reg_no"] == f"ВХ-{year}-0001"
     assert pub["owner"] == "Деканат"
+    assert pub["name"] == "Садыков Нурлан" and pub["group"] == "ИС-24/2"
 
-    assert reader.calls and reader.calls[0]["text"] == SAMPLE_TEXT
+    sent_text = reader.calls[0]["text"]
+    assert sent_text.startswith("Декану факультета\nот студента группы ИС-24/2\nСадыков Нурлан\n\nЗАЯВЛЕНИЕ")
+    assert SAMPLE_TEXT in sent_text and sent_text.endswith("Дата: " + datetime.now().strftime("%d.%m.%Y"))
+    assert reader.calls[0]["form"] == {"surname": "Садыков", "first_name": "Нурлан", "group": "ИС-24/2",
+                                       "kind": "Пересдача экзамена"}
     app_id = only_id(staff)
     d = detail(staff, app_id)
     assert d["status"] == "confirm" and not d["manual"]
@@ -58,15 +63,10 @@ def test_clean_path_to_reply(client, staff, reader):
     edited = d["reply_text"] + "\nДобавлено сотрудником."
     r = staff.post(f"/api/staff/applications/{app_id}/send", json={"text": edited}, headers=H)
     assert r.status_code == 200, r.text
-    assert r.json()["mail_status"] == "not_configured"
     assert r.json()["status"] == "sent"
 
     pub = client.get(f"/api/public/{token}").json()
     assert pub["status"] == "sent" and pub["reply"].endswith("Добавлено сотрудником.")
-
-    outbox = client.app.state.db.all("SELECT * FROM outbox ORDER BY id")
-    assert [o["status"] for o in outbox] == ["not_configured", "not_configured"]   # «получено» и ответ
-    assert "Ответ на обращение" in outbox[1]["subject"]
 
     # повторно отправить нельзя
     r = staff.post(f"/api/staff/applications/{app_id}/send", json={}, headers=H)
@@ -84,7 +84,9 @@ def test_missing_fields_go_to_review_and_staff_fixes(client, staff, reader):
     app_id = only_id(staff)
     d = detail(staff, app_id)
     assert d["status"] == "review"
-    assert sorted(i["key"] for i in d["issues_list"]) == ["date", "group"]
+    assert [i["key"] for i in d["issues_list"]] == ["group"]
+    assert d["fields"]["date"] == {"v": datetime.now().strftime("%d.%m.%Y"), "c": "form"}   # дата подачи
+    assert d["fields"]["sign"]["c"] == "high"
     assert d["reg_no"] == ""
 
     r = staff.post(f"/api/staff/applications/{app_id}/resume", headers=H)
@@ -111,7 +113,7 @@ def test_unknown_type_needs_staff_choice(client, staff, reader):
     resp = json.loads(json.dumps(GOOD))
     resp["type"] = "Другое"
     reader.response = resp
-    submit(client, text=SAMPLE_TEXT)
+    submit(client, text=SAMPLE_TEXT, kind="Другое")
     app_id = only_id(staff)
     d = detail(staff, app_id)
     assert [i["key"] for i in d["issues_list"]] == ["type"]
@@ -133,7 +135,7 @@ def test_change_type_in_confirm_updates_owner_and_reply(client, staff, reader):
 
 
 def test_return_to_student(client, staff, reader):
-    token = submit(client, text=SAMPLE_TEXT, email="s@example.com").json()["token"]
+    token = submit(client, text=SAMPLE_TEXT).json()["token"]
     app_id = only_id(staff)
     r = staff.post(f"/api/staff/applications/{app_id}/return", json={"message": "ok"}, headers=H)
     assert r.status_code == 400
@@ -153,8 +155,8 @@ def test_ai_error_falls_back_to_rules(client, staff, reader):
     d = detail(staff, app_id)
     assert d["status"] == "review"
     assert d["reader"] == "rules" and "Слишком много запросов" in d["reader_note"]
-    assert d["fields"]["group"] == {"v": "ИС-24/2", "c": "low"}
-    assert d["fields"]["date"]["v"] == "09.11.2026"
+    assert d["fields"]["group"] == {"v": "ИС-24/2", "c": "high"}   # совпала с формой
+    assert d["fields"]["date"] == {"v": datetime.now().strftime("%d.%m.%Y"), "c": "form"}
     assert d["type"] == "Пересдача экзамена"
 
     # после восстановления ИИ можно прочитать заново
@@ -175,7 +177,11 @@ def test_ai_disabled_uses_rules(settings, reader):
         row = a.state.db.one("SELECT * FROM applications WHERE public_token = ?", (token,))
         assert row["status"] == "review" and row["reader"] == "rules"
         fields = json.loads(row["fields_json"])
-        assert all(f["c"] in ("low", "missing") for f in fields.values())
+        assert fields["group"]["c"] == "high"                      # подтверждена формой
+        assert fields["date"]["c"] == "form" and fields["sign"]["c"] == "form"   # подано через форму
+        assert row["type"] == "Пересдача экзамена" and row["type_confidence"] in ("high", "form")
+        assert all(f["c"] in ("low", "missing", "high") for f in fields.values() if f["c"] != "form")
+        assert fields["purpose"]["c"] == "low"     # без ИИ суть всегда проверяет сотрудник
     assert reader.calls == []
 
 
@@ -222,9 +228,10 @@ def test_registration_numbers_increase(client, staff, reader):
 
 def test_journal_csv_escapes_formulas(client, staff, reader):
     resp = json.loads(json.dumps(GOOD))
-    resp["fields"]["fio"] = F("=HYPERLINK(\"http://x\") Иванов")
     reader.response = resp
     submit(client, text=SAMPLE_TEXT)
+    app_id = only_id(staff)
+    staff.patch(f"/api/staff/applications/{app_id}/fields", json={"fields": {"fio": "=HYPERLINK(\"http://x\") Иванов"}}, headers=H)
     r = staff.get("/api/staff/journal?format=csv")
     assert r.status_code == 200
     assert r.text.startswith("﻿")
@@ -246,3 +253,71 @@ def test_rules_reader_on_sample():
     assert f["date"]["value"] == "09.11.2026" and f["sign"]["value"] == "есть"
     assert f["fio"]["value"] == "Садыкова Нурлана Ерболатовича"    # без ИИ падеж не меняется: поэтому low
     assert all(v["confidence"] in ("low", "missing") for v in f.values())
+
+
+def test_form_fills_missing_fields(client, staff, reader):
+    resp = json.loads(json.dumps(GOOD))
+    resp["fields"]["fio"] = F("", "missing")
+    resp["fields"]["group"] = F("", "missing")
+    reader.response = resp
+    submit(client, text=SAMPLE_TEXT)
+    d = detail(staff, only_id(staff))
+    assert d["fields"]["fio"] == {"v": "Садыков Нурлан", "c": "form"}
+    assert d["fields"]["group"] == {"v": "ИС-24/2", "c": "form"}
+    assert d["status"] == "confirm" and d["student_group"] == "ИС-24/2"
+
+
+def test_form_mismatch_goes_to_review(client, staff, reader):
+    submit(client, text=SAMPLE_TEXT, surname="Другой", group="ЭК-31")
+    d = detail(staff, only_id(staff))
+    assert d["status"] == "review"
+    assert sorted(i["key"] for i in d["issues_list"]) == ["fio", "group"]
+    assert any("не совпадает с формой" in w for w in d["warnings"])
+
+
+def test_form_genitive_surname_matches(client, staff, reader):
+    reader.error = llm.ReaderError("нет ключа")   # правила: ФИО в родительном падеже
+    submit(client, text=SAMPLE_TEXT)
+    d = detail(staff, only_id(staff))
+    assert not any("ФИО в документе" in w for w in d["warnings"])
+    assert d["fields"]["group"]["c"] == "high"     # документ и форма совпали
+
+
+
+def test_chosen_kind_wins_over_weak_guess(client, staff, reader):
+    resp = json.loads(json.dumps(GOOD))
+    resp["type"], resp["type_confidence"] = "Материальная помощь", "low"
+    reader.response = resp
+    submit(client, text="Прошу выдать мне справку с места учёбы.", kind="Справка с места учёбы")
+    d = detail(staff, only_id(staff))
+    assert d["type"] == "Справка с места учёбы" and d["type_confidence"] == "form"
+    assert d["student_kind"] == "Справка с места учёбы" and d["owner"] == "Учебная часть"
+
+
+def test_kind_conflict_goes_to_staff(client, staff, reader):
+    submit(client, text=SAMPLE_TEXT, kind="Справка с места учёбы")     # модель уверенно видит пересдачу
+    d = detail(staff, only_id(staff))
+    assert d["status"] == "review" and [i["key"] for i in d["issues_list"]] == ["type"]
+    assert any("похоже на «Пересдача экзамена»" in w for w in d["warnings"])
+
+
+def test_kind_required_and_wording_in_meta(client):
+    assert submit(client, text=SAMPLE_TEXT, kind="").status_code == 400
+    assert submit(client, text=SAMPLE_TEXT, kind="Несуществующий").status_code == 400
+    kinds = client.get("/api/meta").json()["kinds"]
+    spravka = next(k for k in kinds if k["name"] == "Справка с места учёбы")
+    assert spravka["addressee"] == "Начальнику учебной части" and spravka["wording"].startswith("Прошу выдать")
+    assert kinds[-1]["name"] == "Другое"
+
+
+def test_file_only_does_not_invent_date(client, staff, reader):
+    from conftest import make_docx
+
+    resp = json.loads(json.dumps(GOOD))
+    resp["fields"]["date"] = F("", "missing")
+    resp["fields"]["sign"] = F("", "missing")
+    reader.response = resp
+    submit(client, files=[("files", ("z.docx", make_docx("Заявление"), "application/octet-stream"))])
+    d = detail(staff, only_id(staff))
+    assert d["text_input"] == ""
+    assert sorted(i["key"] for i in d["issues_list"]) == ["date", "sign"]

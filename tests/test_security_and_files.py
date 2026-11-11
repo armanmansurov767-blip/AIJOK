@@ -67,10 +67,20 @@ def test_public_status_unknown_token(client):
 # ---------- приём ----------
 
 def test_submit_validation(client):
-    assert submit(client, text=SAMPLE_TEXT, consent="").status_code == 400
+    assert submit(client, text=SAMPLE_TEXT, surname="").status_code == 400
+    assert submit(client, text=SAMPLE_TEXT, first_name="  ").status_code == 400
+    assert submit(client, text=SAMPLE_TEXT, group="").status_code == 400
+    assert submit(client, text=SAMPLE_TEXT, surname="<script>").status_code == 400
+    assert submit(client, text=SAMPLE_TEXT, group="ИС-24/2; DROP TABLE").status_code == 400
     assert submit(client, text="коротко").status_code == 400
-    assert submit(client, text=SAMPLE_TEXT, email="not-an-email").status_code == 400
     assert submit(client, text="x" * 20001).status_code == 400
+    assert submit(client, text=SAMPLE_TEXT, surname="Әлі-Хан", first_name="Айгерім", group="ис-24/2").status_code == 200
+
+
+def test_file_without_text_is_enough(client, reader):
+    from conftest import make_docx
+    r = submit(client, files=[("files", ("z.docx", make_docx(SAMPLE_TEXT), "application/octet-stream"))])
+    assert r.status_code == 200
 
 
 def test_submit_rejects_bad_files(client, settings):
